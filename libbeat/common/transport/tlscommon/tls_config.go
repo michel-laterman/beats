@@ -169,6 +169,7 @@ func (c *TLSConfig) BuildServerConfig(host string) *tls.Config {
 }
 
 func makeVerifyConnection(cfg *TLSConfig) func(tls.ConnectionState) error {
+	serverName := cfg.ServerName
 	switch cfg.Verification {
 	case VerifyFull:
 		// Cert is trusted by CA
@@ -187,7 +188,7 @@ func makeVerifyConnection(cfg *TLSConfig) func(tls.ConnectionState) error {
 			if err := verifyCertsWithOpts(cs.PeerCertificates, cfg.CASha256, opts); err != nil {
 				return err
 			}
-			return verifyHostname(cs.PeerCertificates[0], cfg.ServerName)
+			return verifyHostname(cs.PeerCertificates[0], serverName)
 		}
 	case VerifyCertificate:
 		// Cert is trusted by CA
