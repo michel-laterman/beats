@@ -19,6 +19,8 @@ package tlscommon
 
 import (
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
@@ -29,7 +31,9 @@ import (
 	"os"
 	"strings"
 
-	"github.com/elastic/beats/v7/libbeat/logp"
+	"github.com/youmark/pkcs8"
+
+	"github.com/elastic/elastic-agent-libs/logp"
 )
 
 const logSelector = "tls"
@@ -47,17 +51,25 @@ func LoadCertificate(config *CertificateConfig) (*tls.Certificate, error) {
 	}
 
 	log := logp.NewLogger(logSelector)
-
-	certPEM, err := ReadPEMFile(log, certificate, config.Passphrase)
-	if err != nil {
-		log.Errorf("Failed reading certificate file %v: %+v", certificate, err)
-		return nil, fmt.Errorf("%v %v", err, certificate)
+	passphrase := config.Passphrase
+	if passphrase == "" && config.PassphrasePath != "" {
+		p, err := os.ReadFile(config.PassphrasePath)
+		if err != nil {
+			return nil, fmt.Errorf("unable to read passphrase_file: %w", err)
+		}
+		passphrase = string(p)
 	}
 
-	keyPEM, err := ReadPEMFile(log, key, config.Passphrase)
+	certPEM, err := ReadPEMFile(log, certificate, passphrase)
 	if err != nil {
-		log.Errorf("Failed reading key file %v: %+v", key, err)
-		return nil, fmt.Errorf("%v %v", err, key)
+		log.Errorf("Failed reading certificate file %v: %+v", certificate, err)
+		return nil, fmt.Errorf("%w %v", err, certificate)
+	}
+
+	keyPEM, err := ReadPEMFile(log, key, passphrase)
+	if err != nil {
+		log.Errorf("Failed reading key file: %+v", err)
+		return nil, fmt.Errorf("%w %v", err, key)
 	}
 
 	cert, err := tls.X509KeyPair(certPEM, keyPEM)
@@ -66,7 +78,14 @@ func LoadCertificate(config *CertificateConfig) (*tls.Certificate, error) {
 		return nil, err
 	}
 
-	log.Debugf("Loading certificate: %v and key %v", certificate, key)
+	// Do not log the key if it was provided as a string in the configuration to avoid
+	// leaking private keys in the debug logs. Log when the key is a file path.
+	if IsPEMString(key) {
+		log.Debugf("Loading certificate: %v with key from PEM string in config", certificate)
+	} else {
+		log.Debugf("Loading certificate: %v and key %v", certificate, key)
+	}
+
 	return &cert, nil
 }
 
@@ -98,29 +117,24 @@ func ReadPEMFile(log *logp.Logger, s, passphrase string) ([]byte, error) {
 			break
 		}
 
-		if x509.IsEncryptedPEMBlock(block) {
-			var buffer []byte
-			var err error
-			if len(pass) == 0 {
-				err = errors.New("No passphrase available")
-			} else {
-				// Note, decrypting pem might succeed even with wrong password, but
-				// only noise will be stored in buffer in this case.
-				buffer, err = x509.DecryptPEMBlock(block, pass)
-			}
-
+		switch {
+		case x509.IsEncryptedPEMBlock(block): //nolint: staticcheck // deprecated, we have to get rid of it
+			block, err := decryptPKCS1Key(*block, pass)
 			if err != nil {
-				log.Errorf("Dropping encrypted pem '%v' block read from %v. %+v",
-					block.Type, r, err)
+				log.Errorf("Dropping encrypted pem block with private key, block type '%s': %s", block.Type, err)
 				continue
 			}
-
-			// DEK-Info contains encryption info. Remove header to mark block as
-			// unencrypted.
-			delete(block.Headers, "DEK-Info")
-			block.Bytes = buffer
+			blocks = append(blocks, &block)
+		case block.Type == "ENCRYPTED PRIVATE KEY":
+			block, err := decryptPKCS8Key(*block, pass)
+			if err != nil {
+				log.Errorf("Dropping encrypted pem block with private key, block type '%s', could not decypt as PKCS8: %s", block.Type, err)
+				continue
+			}
+			blocks = append(blocks, &block)
+		default:
+			blocks = append(blocks, block)
 		}
-		blocks = append(blocks, block)
 	}
 
 	if len(blocks) == 0 {
@@ -138,6 +152,54 @@ func ReadPEMFile(log *logp.Logger, s, passphrase string) ([]byte, error) {
 	return buffer.Bytes(), nil
 }
 
+func decryptPKCS1Key(block pem.Block, passphrase []byte) (pem.Block, error) {
+	if len(passphrase) == 0 {
+		return block, errors.New("no passphrase available")
+	}
+
+	// Note, decrypting pem might succeed even with wrong password, but
+	// only noise will be stored in buffer in this case.
+	buffer, err := x509.DecryptPEMBlock(&block, passphrase) //nolint: staticcheck // deprecated, we have to get rid of it
+	if err != nil {
+		return block, fmt.Errorf("failed to decrypt pem: %w", err)
+	}
+
+	// DEK-Info contains encryption info. Remove header to mark block as
+	// unencrypted.
+	delete(block.Headers, "DEK-Info")
+	block.Bytes = buffer
+
+	return block, nil
+}
+
+func decryptPKCS8Key(block pem.Block, passphrase []byte) (pem.Block, error) {
+	if len(passphrase) == 0 {
+		return block, errors.New("no passphrase available")
+	}
+
+	key, err := pkcs8.ParsePKCS8PrivateKey(block.Bytes, passphrase)
+	if err != nil {
+		return block, fmt.Errorf("failed to parse key: %w", err)
+	}
+
+	switch key.(type) {
+	case *rsa.PrivateKey:
+		block.Type = "RSA PRIVATE KEY"
+	case *ecdsa.PrivateKey:
+		block.Type = "ECDSA PRIVATE KEY"
+	default:
+		return block, fmt.Errorf("unknown key type %T", key)
+	}
+
+	buffer, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return block, fmt.Errorf("failed to marshal decrypted private key: %w", err)
+	}
+	block.Bytes = buffer
+
+	return block, nil
+}
+
 // LoadCertificateAuthorities read the slice of CAcert and return a Certpool.
 func LoadCertificateAuthorities(CAs []string) (*x509.CertPool, []error) {
 	errors := []error{}
@@ -152,7 +214,7 @@ func LoadCertificateAuthorities(CAs []string) (*x509.CertPool, []error) {
 		r, err := NewPEMReader(s)
 		if err != nil {
 			log.Errorf("Failed reading CA certificate: %+v", err)
-			errors = append(errors, fmt.Errorf("%v reading %v", err, r))
+			errors = append(errors, fmt.Errorf("%w reading %v", err, r))
 			continue
 		}
 		defer r.Close()
@@ -160,13 +222,13 @@ func LoadCertificateAuthorities(CAs []string) (*x509.CertPool, []error) {
 		pemData, err := ioutil.ReadAll(r)
 		if err != nil {
 			log.Errorf("Failed reading CA certificate: %+v", err)
-			errors = append(errors, fmt.Errorf("%v reading %v", err, r))
+			errors = append(errors, fmt.Errorf("%w reading %v", err, r))
 			continue
 		}
 
 		if ok := roots.AppendCertsFromPEM(pemData); !ok {
 			log.Error("Failed to add CA to the cert pool, CA is not a valid PEM document")
-			errors = append(errors, fmt.Errorf("%v adding %v to the list of known CAs", ErrNotACertificate, r))
+			errors = append(errors, fmt.Errorf("%w adding %v to the list of known CAs", ErrNotACertificate, r))
 			continue
 		}
 		log.Debugf("Successfully loaded CA certificate: %v", r)

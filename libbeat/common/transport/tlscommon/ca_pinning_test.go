@@ -19,11 +19,13 @@ package tlscommon
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"fmt"
 	"io/ioutil"
 	"math/big"
 	"net"
@@ -32,22 +34,24 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/elastic/beats/v7/libbeat/common"
+	"github.com/elastic/elastic-agent-libs/config"
 )
 
 var ser int64 = 1
 
 func TestCAPinning(t *testing.T) {
-	host := "127.0.0.1"
+	const (
+		host = "127.0.0.1"
+		addr = "localhost:0"
+	)
 
 	t.Run("when the ca_sha256 field is not defined we use normal certificate validation", func(t *testing.T) {
-		cfg := common.MustNewConfigFrom(map[string]interface{}{
+		cfg := config.MustNewConfigFrom(map[string]interface{}{
 			"verification_mode":       "strict",
-			"certificate_authorities": []string{"ca_test.pem"},
+			"certificate_authorities": []string{"testdata/ca_test.pem"},
 		})
 
 		config := &Config{}
@@ -62,7 +66,7 @@ func TestCAPinning(t *testing.T) {
 	})
 
 	t.Run("when the ca_sha256 field is defined we use CA cert pinning", func(t *testing.T) {
-		cfg := common.MustNewConfigFrom(map[string]interface{}{
+		cfg := config.MustNewConfigFrom(map[string]interface{}{
 			"ca_sha256": "hello",
 		})
 
@@ -90,23 +94,20 @@ func TestCAPinning(t *testing.T) {
 				ca, err := genCA()
 				require.NoError(t, err)
 
-				serverCert, err := genSignedCert(ca, x509.KeyUsageDigitalSignature, false)
+				serverCert, err := genSignedCert(ca, x509.KeyUsageDigitalSignature, false, "localhost", []string{"localhost"}, nil, false)
 				require.NoError(t, err)
 
 				mux := http.NewServeMux()
 				mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 					w.WriteHeader(http.StatusOK)
-					w.Write(msg)
+					_, _ = w.Write(msg)
 				})
-
-				// Select a random available port from the OS.
-				addr := "localhost:0"
 
 				l, err := net.Listen("tcp", addr)
 
-				server := &http.Server{
+				server := &http.Server{ //nolint:gosec // testing
 					Handler: mux,
-					TLSConfig: &tls.Config{
+					TLSConfig: &tls.Config{ //nolint:gosec // testing
 						Certificates: []tls.Certificate{
 							serverCert,
 						},
@@ -114,7 +115,9 @@ func TestCAPinning(t *testing.T) {
 				}
 
 				// Start server and shut it down when the tests are over.
-				go server.ServeTLS(l, "", "")
+				go func() {
+					_ = server.ServeTLS(l, "", "")
+				}()
 				defer l.Close()
 
 				// Root CA Pool
@@ -142,10 +145,11 @@ func TestCAPinning(t *testing.T) {
 
 				port := strings.TrimPrefix(hostToConnect, "127.0.0.1:")
 
-				req, err := http.NewRequest("GET", "https://localhost:"+port, nil)
+				req, err := http.NewRequestWithContext(context.Background(), "GET", "https://localhost:"+port, nil)
 				require.NoError(t, err)
 				resp, err := client.Do(req)
 				require.NoError(t, err)
+				defer resp.Body.Close()
 				content, err := ioutil.ReadAll(resp.Body)
 				require.NoError(t, err)
 
@@ -168,20 +172,17 @@ func TestCAPinning(t *testing.T) {
 		ca, err := genCA()
 		require.NoError(t, err)
 
-		intermediate, err := genSignedCert(ca, x509.KeyUsageDigitalSignature|x509.KeyUsageCertSign, true)
+		intermediate, err := genSignedCert(ca, x509.KeyUsageDigitalSignature|x509.KeyUsageCertSign, true, "localhost", []string{"localhost"}, nil, false)
 		require.NoError(t, err)
 
-		serverCert, err := genSignedCert(intermediate, x509.KeyUsageDigitalSignature, false)
+		serverCert, err := genSignedCert(intermediate, x509.KeyUsageDigitalSignature, false, "localhost", []string{"localhost"}, nil, false)
 		require.NoError(t, err)
 
 		mux := http.NewServeMux()
 		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
-			w.Write(msg)
+			_, _ = w.Write(msg)
 		})
-
-		// Select a random available port from the OS.
-		addr := "localhost:0"
 
 		l, err := net.Listen("tcp", addr)
 		require.NoError(t, err)
@@ -190,9 +191,9 @@ func TestCAPinning(t *testing.T) {
 		// RootCAs will trust the intermediate, intermediate will trust the server.
 		serverCert.Certificate = append(serverCert.Certificate, intermediate.Certificate...)
 
-		server := &http.Server{
+		server := &http.Server{ //nolint:gosec // testing
 			Handler: mux,
-			TLSConfig: &tls.Config{
+			TLSConfig: &tls.Config{ //nolint:gosec // testing
 				Certificates: []tls.Certificate{
 					serverCert,
 				},
@@ -200,7 +201,9 @@ func TestCAPinning(t *testing.T) {
 		}
 
 		// Start server and shut it down when the tests are over.
-		go server.ServeTLS(l, "", "")
+		go func() {
+			_ = server.ServeTLS(l, "", "")
+		}()
 		defer l.Close()
 
 		// Root CA Pool
@@ -226,10 +229,11 @@ func TestCAPinning(t *testing.T) {
 
 		port := strings.TrimPrefix(hostToConnect, "127.0.0.1:")
 
-		req, err := http.NewRequest("GET", "https://localhost:"+port, nil)
+		req, err := http.NewRequestWithContext(context.Background(), "GET", "https://localhost:"+port, nil)
 		require.NoError(t, err)
 		resp, err := client.Do(req)
 		require.NoError(t, err)
+		defer resp.Body.Close()
 		content, err := ioutil.ReadAll(resp.Body)
 		require.NoError(t, err)
 
@@ -242,20 +246,17 @@ func TestCAPinning(t *testing.T) {
 		ca, err := genCA()
 		require.NoError(t, err)
 
-		intermediate, err := genSignedCert(ca, x509.KeyUsageDigitalSignature|x509.KeyUsageCertSign, true)
+		intermediate, err := genSignedCert(ca, x509.KeyUsageDigitalSignature|x509.KeyUsageCertSign, true, "localhost", []string{"localhost"}, nil, false)
 		require.NoError(t, err)
 
-		serverCert, err := genSignedCert(intermediate, x509.KeyUsageDigitalSignature, false)
+		serverCert, err := genSignedCert(intermediate, x509.KeyUsageDigitalSignature, false, "localhost", []string{"localhost"}, nil, false)
 		require.NoError(t, err)
 
 		mux := http.NewServeMux()
 		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
-			w.Write(msg)
+			_, _ = w.Write(msg)
 		})
-
-		// Select a random available port from the OS.
-		addr := "localhost:0"
 
 		l, err := net.Listen("tcp", addr)
 		require.NoError(t, err)
@@ -264,9 +265,9 @@ func TestCAPinning(t *testing.T) {
 		// RootCAs will trust the intermediate, intermediate will trust the server.
 		serverCert.Certificate = append(serverCert.Certificate, intermediate.Certificate...)
 
-		server := &http.Server{
+		server := &http.Server{ //nolint:gosec // testing
 			Handler: mux,
-			TLSConfig: &tls.Config{
+			TLSConfig: &tls.Config{ //nolint:gosec // testing
 				Certificates: []tls.Certificate{
 					serverCert,
 				},
@@ -274,7 +275,9 @@ func TestCAPinning(t *testing.T) {
 		}
 
 		// Start server and shut it down when the tests are over.
-		go server.ServeTLS(l, "", "")
+		go func() {
+			_ = server.ServeTLS(l, "", "")
+		}()
 		defer l.Close()
 
 		// Root CA Pool
@@ -300,9 +303,9 @@ func TestCAPinning(t *testing.T) {
 
 		port := strings.TrimPrefix(hostToConnect, "127.0.0.1:")
 
-		req, err := http.NewRequest("GET", "https://localhost:"+port, nil)
+		req, err := http.NewRequestWithContext(context.Background(), "GET", "https://localhost:"+port, nil)
 		require.NoError(t, err)
-		_, err = client.Do(req)
+		_, err = client.Do(req) //nolint: bodyclose // body cannot be closed because it is nil
 		require.Error(t, err)
 	})
 }
@@ -329,17 +332,17 @@ func genCA() (tls.Certificate, error) {
 
 	caKey, err := rsa.GenerateKey(rand.Reader, 2048) // less secure key for quicker testing.
 	if err != nil {
-		return tls.Certificate{}, errors.Wrap(err, "fail to generate RSA key")
+		return tls.Certificate{}, fmt.Errorf("fail to generate RSA key: %w", err)
 	}
 
 	caBytes, err := x509.CreateCertificate(rand.Reader, ca, ca, &caKey.PublicKey, caKey)
 	if err != nil {
-		return tls.Certificate{}, errors.Wrap(err, "fail to create certificate")
+		return tls.Certificate{}, fmt.Errorf("fail to create certificate: %w", err)
 	}
 
 	leaf, err := x509.ParseCertificate(caBytes)
 	if err != nil {
-		return tls.Certificate{}, errors.Wrap(err, "fail to parse certificate")
+		return tls.Certificate{}, fmt.Errorf("fail to parse certificate: %w", err)
 	}
 
 	return tls.Certificate{
@@ -350,13 +353,36 @@ func genCA() (tls.Certificate, error) {
 }
 
 // genSignedCert generates a CA and KeyPair and remove the need to depends on code of agent.
-func genSignedCert(ca tls.Certificate, keyUsage x509.KeyUsage, isCA bool) (tls.Certificate, error) {
+func genSignedCert(
+	ca tls.Certificate,
+	keyUsage x509.KeyUsage,
+	isCA bool,
+	commonName string,
+	dnsNames []string,
+	ips []net.IP,
+	expired bool,
+) (tls.Certificate, error) {
+	if commonName == "" {
+		commonName = "You know, for search"
+	}
+
+	notBefore := time.Now()
+	notAfter := notBefore.Add(5 * time.Hour)
+
+	if expired {
+		notBefore = notBefore.Add(-42 * time.Hour)
+		notAfter = notAfter.Add(-42 * time.Hour)
+	}
 	// Create another Cert/key
 	cert := &x509.Certificate{
-		DNSNames:     []string{"localhost"},
 		SerialNumber: big.NewInt(2000),
+
+		// SNA - Subject Alternative Name fields
+		IPAddresses: ips,
+		DNSNames:    dnsNames,
+
 		Subject: pkix.Name{
-			CommonName:    "localhost",
+			CommonName:    commonName,
 			Organization:  []string{"TESTING"},
 			Country:       []string{"CANADA"},
 			Province:      []string{"QUEBEC"},
@@ -364,8 +390,9 @@ func genSignedCert(ca tls.Certificate, keyUsage x509.KeyUsage, isCA bool) (tls.C
 			StreetAddress: []string{"testing road"},
 			PostalCode:    []string{"HOH OHO"},
 		},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().Add(1 * time.Hour),
+
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
 		IsCA:                  isCA,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
 		KeyUsage:              keyUsage,
@@ -374,7 +401,7 @@ func genSignedCert(ca tls.Certificate, keyUsage x509.KeyUsage, isCA bool) (tls.C
 
 	certKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-		return tls.Certificate{}, errors.Wrap(err, "fail to generate RSA key")
+		return tls.Certificate{}, fmt.Errorf("fail to generate RSA key: %w", err)
 	}
 
 	certBytes, err := x509.CreateCertificate(
@@ -386,12 +413,12 @@ func genSignedCert(ca tls.Certificate, keyUsage x509.KeyUsage, isCA bool) (tls.C
 	)
 
 	if err != nil {
-		return tls.Certificate{}, errors.Wrap(err, "fail to create signed certificate")
+		return tls.Certificate{}, fmt.Errorf("fail to create signed certificate: %w", err)
 	}
 
 	leaf, err := x509.ParseCertificate(certBytes)
 	if err != nil {
-		return tls.Certificate{}, errors.Wrap(err, "fail to parse the certificate")
+		return tls.Certificate{}, fmt.Errorf("fail to parse the certificate: %w", err)
 	}
 
 	return tls.Certificate{

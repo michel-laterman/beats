@@ -21,16 +21,11 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
-
-	"github.com/pkg/errors"
+	"errors"
 )
 
 // ErrCAPinMissmatch is returned when no pin is matched in the verified chain.
 var ErrCAPinMissmatch = errors.New("provided CA certificate pins doesn't match any of the certificate authorities used to validate the certificate")
-
-// verifyPeerCertFunc is a callback defined on the tls.Config struct that will called when a
-// TLS connection is used.
-type verifyPeerCertFunc func([][]byte, [][]*x509.Certificate) error
 
 // verifyCAPin loops through the verified chains and will try to match the certificates pin.
 //

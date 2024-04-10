@@ -19,26 +19,21 @@ package tlscommon
 
 import (
 	"crypto/tls"
-	"sync"
-
-	"github.com/joeshaw/multierror"
-
-	"github.com/elastic/beats/v7/libbeat/common/cfgwarn"
+	"errors"
 )
-
-var warnOnce sync.Once
 
 // Config defines the user configurable options in the yaml file.
 type Config struct {
-	Enabled          *bool                   `config:"enabled" yaml:"enabled,omitempty"`
-	VerificationMode TLSVerificationMode     `config:"verification_mode" yaml:"verification_mode"` // one of 'none', 'full'
-	Versions         []TLSVersion            `config:"supported_protocols" yaml:"supported_protocols,omitempty"`
-	CipherSuites     []CipherSuite           `config:"cipher_suites" yaml:"cipher_suites,omitempty"`
-	CAs              []string                `config:"certificate_authorities" yaml:"certificate_authorities,omitempty"`
-	Certificate      CertificateConfig       `config:",inline" yaml:",inline"`
-	CurveTypes       []tlsCurveType          `config:"curve_types" yaml:"curve_types,omitempty"`
-	Renegotiation    TlsRenegotiationSupport `config:"renegotiation" yaml:"renegotiation"`
-	CASha256         []string                `config:"ca_sha256" yaml:"ca_sha256,omitempty"`
+	Enabled              *bool                   `config:"enabled" yaml:"enabled,omitempty"`
+	VerificationMode     TLSVerificationMode     `config:"verification_mode" yaml:"verification_mode"` // one of 'none', 'full'
+	Versions             []TLSVersion            `config:"supported_protocols" yaml:"supported_protocols,omitempty"`
+	CipherSuites         []CipherSuite           `config:"cipher_suites" yaml:"cipher_suites,omitempty"`
+	CAs                  []string                `config:"certificate_authorities" yaml:"certificate_authorities,omitempty"`
+	Certificate          CertificateConfig       `config:",inline" yaml:",inline"`
+	CurveTypes           []tlsCurveType          `config:"curve_types" yaml:"curve_types,omitempty"`
+	Renegotiation        TLSRenegotiationSupport `config:"renegotiation" yaml:"renegotiation"`
+	CASha256             []string                `config:"ca_sha256" yaml:"ca_sha256,omitempty"`
+	CATrustedFingerprint string                  `config:"ca_trusted_fingerprint" yaml:"ca_trusted_fingerprint,omitempty"`
 }
 
 // LoadTLSConfig will load a certificate from config with all TLS based keys
@@ -50,7 +45,7 @@ func LoadTLSConfig(config *Config) (*TLSConfig, error) {
 		return nil, nil
 	}
 
-	fail := multierror.Errors{}
+	var fail []error
 	logFail := func(es ...error) {
 		for _, e := range es {
 			if e != nil {
@@ -59,9 +54,9 @@ func LoadTLSConfig(config *Config) (*TLSConfig, error) {
 		}
 	}
 
-	var curves []tls.CurveID
-	for _, id := range config.CurveTypes {
-		curves = append(curves, tls.CurveID(id))
+	curves := make([]tls.CurveID, len(config.CurveTypes))
+	for idx, id := range config.CurveTypes {
+		curves[idx] = tls.CurveID(id)
 	}
 
 	cert, err := LoadCertificate(&config.Certificate)
@@ -71,35 +66,32 @@ func LoadTLSConfig(config *Config) (*TLSConfig, error) {
 	logFail(errs...)
 
 	// fail, if any error occurred when loading certificate files
-	if err = fail.Err(); err != nil {
-		return nil, err
+	if len(fail) != 0 {
+		return nil, errors.Join(fail...)
 	}
 
-	var certs []tls.Certificate
+	certs := make([]tls.Certificate, 0)
 	if cert != nil {
 		certs = []tls.Certificate{*cert}
 	}
 
 	// return config if no error occurred
 	return &TLSConfig{
-		Versions:         config.Versions,
-		Verification:     config.VerificationMode,
-		Certificates:     certs,
-		RootCAs:          cas,
-		CipherSuites:     config.CipherSuites,
-		CurvePreferences: curves,
-		Renegotiation:    tls.RenegotiationSupport(config.Renegotiation),
-		CASha256:         config.CASha256,
+		Versions:             config.Versions,
+		Verification:         config.VerificationMode,
+		Certificates:         certs,
+		RootCAs:              cas,
+		CipherSuites:         config.CipherSuites,
+		CurvePreferences:     curves,
+		Renegotiation:        tls.RenegotiationSupport(config.Renegotiation),
+		CASha256:             config.CASha256,
+		CATrustedFingerprint: config.CATrustedFingerprint,
 	}, nil
 }
 
 // Validate values the TLSConfig struct making sure certificate sure we have both a certificate and
 // a key.
 func (c *Config) Validate() error {
-	warnOnce.Do(func() {
-		cfgwarn.Deprecate("8.0.0", "Treating the CommonName field on X.509 certificates as a host name when no Subject Alternative Names are present is going to be removed. Please update your certificates if needed.")
-	})
-
 	return c.Certificate.Validate()
 }
 

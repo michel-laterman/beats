@@ -19,22 +19,22 @@ package tlscommon
 
 import (
 	"crypto/tls"
+	"errors"
+	"fmt"
 
-	"github.com/joeshaw/multierror"
-
-	"github.com/elastic/beats/v7/libbeat/common"
+	"github.com/elastic/elastic-agent-libs/config"
 )
 
 // ServerConfig defines the user configurable tls options for any TCP based service.
 type ServerConfig struct {
-	Enabled          *bool               `config:"enabled"`
-	VerificationMode TLSVerificationMode `config:"verification_mode"` // one of 'none', 'full', 'strict', 'certificate'
-	Versions         []TLSVersion        `config:"supported_protocols"`
-	CipherSuites     []CipherSuite       `config:"cipher_suites"`
-	CAs              []string            `config:"certificate_authorities"`
-	Certificate      CertificateConfig   `config:",inline"`
-	CurveTypes       []tlsCurveType      `config:"curve_types"`
-	ClientAuth       tlsClientAuth       `config:"client_authentication"` //`none`, `optional` or `required`
+	Enabled          *bool               `config:"enabled" yaml:"enabled,omitempty"`
+	VerificationMode TLSVerificationMode `config:"verification_mode" yaml:"verification_mode,omitempty"` // one of 'none', 'full', 'strict', 'certificate'
+	Versions         []TLSVersion        `config:"supported_protocols" yaml:"supported_protocols,omitempty"`
+	CipherSuites     []CipherSuite       `config:"cipher_suites" yaml:"cipher_suites,omitempty"`
+	CAs              []string            `config:"certificate_authorities" yaml:"certificate_authorities,omitempty"`
+	Certificate      CertificateConfig   `config:",inline" yaml:",inline"`
+	CurveTypes       []tlsCurveType      `config:"curve_types" yaml:"curve_types,omitempty"`
+	ClientAuth       *TLSClientAuth      `config:"client_authentication" yaml:"client_authentication,omitempty"` //`none`, `optional` or `required`
 	CASha256         []string            `config:"ca_sha256" yaml:"ca_sha256,omitempty"`
 }
 
@@ -45,7 +45,7 @@ func LoadTLSServerConfig(config *ServerConfig) (*TLSConfig, error) {
 		return nil, nil
 	}
 
-	fail := multierror.Errors{}
+	var fail []error
 	logFail := func(es ...error) {
 		for _, e := range es {
 			if e != nil {
@@ -54,14 +54,14 @@ func LoadTLSServerConfig(config *ServerConfig) (*TLSConfig, error) {
 		}
 	}
 
-	var cipherSuites []uint16
-	for _, suite := range config.CipherSuites {
-		cipherSuites = append(cipherSuites, uint16(suite))
+	cipherSuites := make([]uint16, len(config.CipherSuites))
+	for idx, suite := range config.CipherSuites {
+		cipherSuites[idx] = uint16(suite)
 	}
 
-	var curves []tls.CurveID
-	for _, id := range config.CurveTypes {
-		curves = append(curves, tls.CurveID(id))
+	curves := make([]tls.CurveID, len(config.CurveTypes))
+	for idx, id := range config.CurveTypes {
+		curves[idx] = tls.CurveID(id)
 	}
 
 	cert, err := LoadCertificate(&config.Certificate)
@@ -71,13 +71,18 @@ func LoadTLSServerConfig(config *ServerConfig) (*TLSConfig, error) {
 	logFail(errs...)
 
 	// fail, if any error occurred when loading certificate files
-	if err = fail.Err(); err != nil {
-		return nil, err
+	if len(fail) != 0 {
+		return nil, errors.Join(fail...)
 	}
 
-	var certs []tls.Certificate
+	certs := make([]tls.Certificate, 0)
 	if cert != nil {
 		certs = []tls.Certificate{*cert}
+	}
+
+	clientAuth := TLSClientAuthNone
+	if config.ClientAuth != nil {
+		clientAuth = *config.ClientAuth
 	}
 
 	// return config if no error occurred
@@ -88,20 +93,23 @@ func LoadTLSServerConfig(config *ServerConfig) (*TLSConfig, error) {
 		ClientCAs:        cas,
 		CipherSuites:     config.CipherSuites,
 		CurvePreferences: curves,
-		ClientAuth:       tls.ClientAuthType(config.ClientAuth),
+		ClientAuth:       tls.ClientAuthType(clientAuth),
 		CASha256:         config.CASha256,
 	}, nil
 }
 
 // Unpack unpacks the TLS Server configuration.
-func (c *ServerConfig) Unpack(cfg common.Config) error {
+func (c *ServerConfig) Unpack(cfg config.C) error {
 	const clientAuthKey = "client_authentication"
 	const ca = "certificate_authorities"
 
-	// When we have explicitely defined the `certificate_authorities` in the configuration we default
+	// When we have explicitly defined the `certificate_authorities` in the configuration we default
 	// to `required` for the `client_authentication`, when CA is not defined we should set to `none`.
 	if cfg.HasField(ca) && !cfg.HasField(clientAuthKey) {
-		cfg.SetString(clientAuthKey, -1, "required")
+		err := cfg.SetString(clientAuthKey, -1, "required")
+		if err != nil {
+			return fmt.Errorf("failed to set client_authentication to required: %w", err)
+		}
 	}
 	type serverCfg ServerConfig
 	var sCfg serverCfg

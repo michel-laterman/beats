@@ -19,38 +19,31 @@ package tlscommon
 
 import (
 	"bytes"
-	"crypto/rand"
-	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
-	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/pem"
-	"io/ioutil"
-	"log"
-	"math/big"
+	"errors"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestMakeVerifyServerConnection(t *testing.T) {
-	testCerts, err := openTestCerts()
-	if err != nil {
-		t.Fatalf("failed to open test certs: %+v", err)
-	}
+	testCerts := genTestCerts(t)
 
-	testCA, errs := LoadCertificateAuthorities([]string{
-		filepath.Join("testdata", "ca.crt"),
-		filepath.Join("testdata", "cacert.crt"),
-	})
-	if len(errs) > 0 {
-		t.Fatalf("failed to load test certificate authorities: %+v", errs)
-	}
+	certPool := x509.NewCertPool()
+	certPool.AddCert(testCerts["ca"])
 
 	testcases := map[string]struct {
 		verificationMode TLSVerificationMode
@@ -67,12 +60,12 @@ func TestMakeVerifyServerConnection(t *testing.T) {
 			peerCerts:        nil,
 			serverName:       "",
 			expectedCallback: true,
-			expectedError:    MissingPeerCertificate,
+			expectedError:    ErrMissingPeerCertificate,
 		},
 		"default verification with certificates when required with expired cert": {
 			verificationMode: VerifyFull,
 			clientAuth:       tls.RequireAndVerifyClientCert,
-			certAuthorities:  testCA,
+			certAuthorities:  certPool,
 			peerCerts:        []*x509.Certificate{testCerts["expired"]},
 			serverName:       "",
 			expectedCallback: true,
@@ -81,7 +74,7 @@ func TestMakeVerifyServerConnection(t *testing.T) {
 		"default verification with certificates when required with incorrect server name in cert": {
 			verificationMode: VerifyFull,
 			clientAuth:       tls.RequireAndVerifyClientCert,
-			certAuthorities:  testCA,
+			certAuthorities:  certPool,
 			peerCerts:        []*x509.Certificate{testCerts["correct"]},
 			serverName:       "bad.example.com",
 			expectedCallback: true,
@@ -90,7 +83,7 @@ func TestMakeVerifyServerConnection(t *testing.T) {
 		"default verification with certificates when required with correct cert": {
 			verificationMode: VerifyFull,
 			clientAuth:       tls.RequireAndVerifyClientCert,
-			certAuthorities:  testCA,
+			certAuthorities:  certPool,
 			peerCerts:        []*x509.Certificate{testCerts["correct"]},
 			serverName:       "localhost",
 			expectedCallback: true,
@@ -99,7 +92,7 @@ func TestMakeVerifyServerConnection(t *testing.T) {
 		"default verification with certificates when required with correct wildcard cert": {
 			verificationMode: VerifyFull,
 			clientAuth:       tls.RequireAndVerifyClientCert,
-			certAuthorities:  testCA,
+			certAuthorities:  certPool,
 			peerCerts:        []*x509.Certificate{testCerts["wildcard"]},
 			serverName:       "hello.example.com",
 			expectedCallback: true,
@@ -108,7 +101,7 @@ func TestMakeVerifyServerConnection(t *testing.T) {
 		"certificate verification with certificates when required with correct cert": {
 			verificationMode: VerifyCertificate,
 			clientAuth:       tls.RequireAndVerifyClientCert,
-			certAuthorities:  testCA,
+			certAuthorities:  certPool,
 			peerCerts:        []*x509.Certificate{testCerts["correct"]},
 			serverName:       "localhost",
 			expectedCallback: true,
@@ -117,7 +110,7 @@ func TestMakeVerifyServerConnection(t *testing.T) {
 		"certificate verification with certificates when required with expired cert": {
 			verificationMode: VerifyCertificate,
 			clientAuth:       tls.RequireAndVerifyClientCert,
-			certAuthorities:  testCA,
+			certAuthorities:  certPool,
 			peerCerts:        []*x509.Certificate{testCerts["expired"]},
 			serverName:       "localhost",
 			expectedCallback: true,
@@ -126,7 +119,7 @@ func TestMakeVerifyServerConnection(t *testing.T) {
 		"certificate verification with certificates when required with incorrect server name in cert": {
 			verificationMode: VerifyCertificate,
 			clientAuth:       tls.RequireAndVerifyClientCert,
-			certAuthorities:  testCA,
+			certAuthorities:  certPool,
 			peerCerts:        []*x509.Certificate{testCerts["correct"]},
 			serverName:       "bad.example.com",
 			expectedCallback: true,
@@ -135,20 +128,20 @@ func TestMakeVerifyServerConnection(t *testing.T) {
 		"strict verification with certificates when required with correct cert": {
 			verificationMode: VerifyStrict,
 			clientAuth:       tls.RequireAndVerifyClientCert,
-			certAuthorities:  testCA,
+			certAuthorities:  certPool,
 			peerCerts:        []*x509.Certificate{testCerts["correct"]},
 			serverName:       "localhost",
 			expectedCallback: false,
 			expectedError:    nil,
 		},
-		"default verification with certificates when required with cert signed by unkown authority": {
+		"default verification with certificates when required with cert signed by unknown authority": {
 			verificationMode: VerifyFull,
 			clientAuth:       tls.RequireAndVerifyClientCert,
-			certAuthorities:  testCA,
-			peerCerts:        []*x509.Certificate{testCerts["unknown authority"]},
+			certAuthorities:  certPool,
+			peerCerts:        []*x509.Certificate{testCerts["unknown_authority"]},
 			serverName:       "",
 			expectedCallback: true,
-			expectedError:    x509.UnknownAuthorityError{Cert: testCerts["unknown authority"]},
+			expectedError:    x509.UnknownAuthorityError{Cert: testCerts["unknown_authority"]},
 		},
 		"default verification without certificates not required": {
 			verificationMode: VerifyFull,
@@ -169,7 +162,6 @@ func TestMakeVerifyServerConnection(t *testing.T) {
 
 	for name, test := range testcases {
 		t.Run(name, func(t *testing.T) {
-			test := test
 			cfg := &TLSConfig{
 				Verification: test.verificationMode,
 				ClientAuth:   test.clientAuth,
@@ -187,196 +179,427 @@ func TestMakeVerifyServerConnection(t *testing.T) {
 				ServerName:       test.serverName,
 			})
 			if test.expectedError == nil {
-				assert.Nil(t, err)
+				assert.NoError(t, err)
 			} else {
-				assert.Error(t, test.expectedError, err)
+				require.Error(t, err)
+				// We want to ensure the error type/message are the expected ones
+				// so we compare the types and the message
+				assert.IsType(t, test.expectedError, err)
+				assert.Contains(t, err.Error(), test.expectedError.Error())
 			}
 		})
 	}
-
 }
 
-func openTestCerts() (map[string]*x509.Certificate, error) {
-	certs := make(map[string]*x509.Certificate, 0)
+func TestTrustRootCA(t *testing.T) {
+	certs := genTestCerts(t)
 
-	for testcase, certname := range map[string]string{
-		"expired":           "tls.crt",
-		"unknown authority": "unsigned_tls.crt",
-		"correct":           "client1.crt",
-		"wildcard":          "server.crt",
-	} {
+	nonEmptyCertPool := x509.NewCertPool()
+	nonEmptyCertPool.AddCert(certs["wildcard"])
+	nonEmptyCertPool.AddCert(certs["unknown_authority"])
 
-		certBytes, err := ioutil.ReadFile(filepath.Join("testdata", certname))
-		if err != nil {
-			return nil, err
-		}
-		block, _ := pem.Decode(certBytes)
-		testCert, err := x509.ParseCertificate(block.Bytes)
-		if err != nil {
-			return nil, err
-		}
-		certs[testcase] = testCert
+	fingerprint := getFingerprint(certs["ca"])
+
+	testCases := []struct {
+		name                 string
+		rootCAs              *x509.CertPool
+		caTrustedFingerprint string
+		peerCerts            []*x509.Certificate
+		expectingError       bool
+		expectedRootCAsLen   int
+	}{
+		{
+			name:                 "RootCA cert matches the fingerprint and is added to cfg.RootCAs",
+			caTrustedFingerprint: fingerprint,
+			peerCerts:            []*x509.Certificate{certs["correct"], certs["ca"]},
+			expectedRootCAsLen:   1,
+		},
+		{
+			name:                 "RootCA cert doesn not matche the fingerprint and is not added to cfg.RootCAs",
+			caTrustedFingerprint: fingerprint,
+			peerCerts:            []*x509.Certificate{certs["correct"], certs["ca"]},
+			expectedRootCAsLen:   0,
+		},
+		{
+			name:                 "non empty CertPool has the RootCA added",
+			rootCAs:              nonEmptyCertPool,
+			caTrustedFingerprint: fingerprint,
+			peerCerts:            []*x509.Certificate{certs["correct"], certs["ca"]},
+			expectedRootCAsLen:   3,
+		},
+		{
+			name:                 "invalis HEX encoding",
+			caTrustedFingerprint: "INVALID ENCODING",
+			expectedRootCAsLen:   0,
+			expectingError:       true,
+		},
 	}
 
-	return certs, nil
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := TLSConfig{
+				RootCAs:              tc.rootCAs,
+				CATrustedFingerprint: tc.caTrustedFingerprint,
+			}
+			err := trustRootCA(&cfg, tc.peerCerts)
+			if tc.expectingError && err == nil {
+				t.Fatal("expecting an error when calling trustRootCA")
+			}
+
+			if !tc.expectingError && err != nil {
+				t.Fatalf("did not expect an error calling trustRootCA: %v", err)
+			}
+
+			if tc.expectedRootCAsLen != 0 {
+				if cfg.RootCAs == nil {
+					t.Fatal("cfg.RootCAs cannot be nil")
+				}
+
+				// we want to know the number of certificates in the CertPool (RootCAs), as it is not
+				// directly available, we use this workaround of reading the number of subjects in the pool.
+				if got, expected := len(cfg.RootCAs.Subjects()), tc.expectedRootCAsLen; got != expected {
+					t.Fatalf("expecting cfg.RootCAs to have %d element, got %d instead", expected, got)
+				}
+			}
+		})
+	}
 }
 
-func TestVerificationMode(t *testing.T) {
+func TestMakeVerifyConnectionUsesCATrustedFingerprint(t *testing.T) {
+	testCerts := genTestCerts(t)
+	fingerprint := getFingerprint(testCerts["ca"])
+
 	testcases := map[string]struct {
-		verificationMode TLSVerificationMode
-		serverName       string
-		certHostname     string
-		expectingError   bool
-		ignoreCerts      bool
-		emptySNA         bool
-		legacyCN         bool
+		verificationMode     TLSVerificationMode
+		peerCerts            []*x509.Certificate
+		serverName           string
+		expectedCallback     bool
+		expectingError       bool
+		CATrustedFingerprint string
+		CASHA256             []string
 	}{
-		"VerifyFull validates domain": {
-			verificationMode: VerifyFull,
-			serverName:       "localhost",
-			certHostname:     "localhost",
+		"CATrustedFingerprint and verification mode:VerifyFull": {
+			verificationMode:     VerifyFull,
+			peerCerts:            []*x509.Certificate{testCerts["correct"], testCerts["ca"]},
+			serverName:           "localhost",
+			expectedCallback:     true,
+			CATrustedFingerprint: fingerprint,
 		},
-		"VerifyFull validates IPv4": {
-			verificationMode: VerifyFull,
-			serverName:       "127.0.0.1",
-			certHostname:     "127.0.0.1",
+		"CATrustedFingerprint and verification mode:VerifyCertificate": {
+			verificationMode:     VerifyCertificate,
+			peerCerts:            []*x509.Certificate{testCerts["correct"], testCerts["ca"]},
+			serverName:           "localhost",
+			expectedCallback:     true,
+			CATrustedFingerprint: fingerprint,
 		},
-		"VerifyFull validates IPv6": {
-			verificationMode: VerifyFull,
-			serverName:       "::1",
-			certHostname:     "::1",
+		"CATrustedFingerprint and verification mode:VerifyStrict": {
+			verificationMode:     VerifyStrict,
+			peerCerts:            []*x509.Certificate{testCerts["correct"], testCerts["ca"]},
+			serverName:           "localhost",
+			expectedCallback:     true,
+			CATrustedFingerprint: fingerprint,
+			CASHA256:             []string{Fingerprint(testCerts["correct"])},
 		},
-		"VerifyFull domain mismatch returns error": {
-			verificationMode: VerifyFull,
-			serverName:       "localhost",
-			certHostname:     "elastic.co",
-			expectingError:   true,
-		},
-		"VerifyFull IPv4 mismatch returns error": {
-			verificationMode: VerifyFull,
-			serverName:       "127.0.0.1",
-			certHostname:     "1.2.3.4",
-			expectingError:   true,
-		},
-		"VerifyFull IPv6 mismatch returns error": {
-			verificationMode: VerifyFull,
-			serverName:       "::1",
-			certHostname:     "faca:b0de:baba::ca",
-			expectingError:   true,
-		},
-		"VerifyFull does not return error when SNA is empty and legacy Common Name is used": {
-			verificationMode: VerifyFull,
-			serverName:       "localhost",
-			certHostname:     "localhost",
-			emptySNA:         true,
-			legacyCN:         true,
-			expectingError:   false,
-		},
-		"VerifyFull does not return error when SNA is empty and legacy Common Name is used with IP address": {
-			verificationMode: VerifyFull,
-			serverName:       "127.0.0.1",
-			certHostname:     "127.0.0.1",
-			emptySNA:         true,
-			legacyCN:         true,
-			expectingError:   false,
-		},
-
-		"VerifyStrict": {
-			verificationMode: VerifyStrict,
-			serverName:       "localhost",
-			certHostname:     "localhost",
-		},
-		"VerifyStrict validates domain": {
-			verificationMode: VerifyStrict,
-			serverName:       "localhost",
-			certHostname:     "localhost",
-		},
-		"VerifyStrict validates IPv4": {
-			verificationMode: VerifyStrict,
-			serverName:       "127.0.0.1",
-			certHostname:     "127.0.0.1",
-		},
-		"VerifyStrict validates IPv6": {
-			verificationMode: VerifyStrict,
-			serverName:       "::1",
-			certHostname:     "::1",
-		},
-		"VerifyStrict domain mismatch returns error": {
-			verificationMode: VerifyStrict,
-			serverName:       "127.0.0.1",
-			certHostname:     "elastic.co",
-			expectingError:   true,
-		},
-		"VerifyStrict IPv4 mismatch returns error": {
-			verificationMode: VerifyStrict,
-			serverName:       "127.0.0.1",
-			certHostname:     "1.2.3.4",
-			expectingError:   true,
-		},
-		"VerifyStrict IPv6 mismatch returns error": {
-			verificationMode: VerifyStrict,
-			serverName:       "::1",
-			certHostname:     "faca:b0de:baba::ca",
-			expectingError:   true,
-		},
-		"VerifyStrict return error when SNA is empty and legacy Common Name is used": {
-			verificationMode: VerifyStrict,
-			serverName:       "localhost",
-			certHostname:     "localhost",
-			emptySNA:         true,
-			legacyCN:         true,
-			expectingError:   true,
-		},
-		"VerifyStrict return error when SNA is empty and legacy Common Name is used with IP address": {
-			verificationMode: VerifyStrict,
-			serverName:       "127.0.0.1",
-			certHostname:     "127.0.0.1",
-			emptySNA:         true,
-			legacyCN:         true,
-			expectingError:   true,
-		},
-		"VerifyStrict returns error when SNA is empty": {
-			verificationMode: VerifyStrict,
-			serverName:       "localhost",
-			certHostname:     "localhost",
-			emptySNA:         true,
-			expectingError:   true,
-		},
-
-		"VerifyCertificate does not validate domain": {
-			verificationMode: VerifyCertificate,
-			serverName:       "localhost",
-			certHostname:     "elastic.co",
-		},
-		"VerifyCertificate does not validate IPv4": {
-			verificationMode: VerifyCertificate,
-			serverName:       "127.0.0.1",
-			certHostname:     "elastic.co",
-		},
-		"VerifyCertificate does not validate IPv6": {
-			verificationMode: VerifyCertificate,
-			serverName:       "127.0.0.1",
-			certHostname:     "faca:b0de:baba::ca",
-		},
-
-		"VerifyNone accepts untrusted certificates": {
+		"CATrustedFingerprint and verification mode:VerifyNone": {
 			verificationMode: VerifyNone,
-			serverName:       "127.0.0.1",
-			certHostname:     "faca:b0de:baba::ca",
-			ignoreCerts:      true,
+			peerCerts:        []*x509.Certificate{testCerts["correct"], testCerts["ca"]},
+			serverName:       "localhost",
+			expectedCallback: false,
+		},
+		"invalid CATrustedFingerprint and verification mode:VerifyFull returns error": {
+			verificationMode:     VerifyFull,
+			peerCerts:            []*x509.Certificate{testCerts["correct"], testCerts["ca"]},
+			serverName:           "localhost",
+			expectedCallback:     true,
+			CATrustedFingerprint: "INVALID HEX ENCODING",
+			expectingError:       true,
+		},
+		"invalid CATrustedFingerprint and verification mode:VerifyCertificate returns error": {
+			verificationMode:     VerifyCertificate,
+			peerCerts:            []*x509.Certificate{testCerts["correct"], testCerts["ca"]},
+			serverName:           "localhost",
+			expectedCallback:     true,
+			CATrustedFingerprint: "INVALID HEX ENCODING",
+			expectingError:       true,
+		},
+		"invalid CATrustedFingerprint and verification mode:VerifyStrict returns error": {
+			verificationMode:     VerifyStrict,
+			peerCerts:            []*x509.Certificate{testCerts["correct"], testCerts["ca"]},
+			serverName:           "localhost",
+			expectedCallback:     true,
+			CATrustedFingerprint: "INVALID HEX ENCODING",
+			expectingError:       true,
+			CASHA256:             []string{Fingerprint(testCerts["correct"])},
 		},
 	}
 
 	for name, test := range testcases {
 		t.Run(name, func(t *testing.T) {
-			serverURL, caCert := startTestServer(t, test.certHostname, test.emptySNA, test.legacyCN)
-			certPool := x509.NewCertPool()
-			certPool.AddCert(caCert)
+			cfg := &TLSConfig{
+				Verification:         test.verificationMode,
+				CATrustedFingerprint: test.CATrustedFingerprint,
+				CASha256:             test.CASHA256,
+			}
+
+			verifier := makeVerifyConnection(cfg)
+			if test.expectedCallback {
+				require.NotNil(t, verifier, "makeVerifyConnection returned a nil verifier")
+			} else {
+				require.Nil(t, verifier)
+				return
+			}
+
+			err := verifier(tls.ConnectionState{
+				PeerCertificates: test.peerCerts,
+				ServerName:       test.serverName,
+				VerifiedChains:   [][]*x509.Certificate{test.peerCerts},
+			})
+			if test.expectingError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestMakeVerifyServerConnectionForIPs(t *testing.T) {
+	testcases := map[string]struct {
+		dnsNames         []string
+		commonName       string
+		expectingError   bool
+		ips              []net.IP
+		peerCerts        []*x509.Certificate
+		serverName       string
+		verificationMode TLSVerificationMode
+	}{
+		"IP matches the Certificate IPs field": {
+			expectingError: false,
+			ips:            []net.IP{net.IPv4(127, 0, 0, 1)},
+			serverName:     "127.0.0.1",
+			commonName:     "a.host.name.elastic.co",
+		},
+		"IP does not match the Certificate IPs field": {
+			expectingError: true,
+			ips:            []net.IP{net.IPv4(192, 168, 42, 42)},
+			serverName:     "127.0.0.1",
+			commonName:     "a.host.name.elastic.co",
+		},
+		"IP in SNA hostnames do not work": {
+			expectingError: true,
+			dnsNames:       []string{"127.0.0.1"},
+			serverName:     "127.0.0.1",
+			commonName:     "a.host.name.elastic.co",
+		},
+		"IP in CN works": {
+			expectingError: false,
+			serverName:     "127.0.0.1",
+			commonName:     "127.0.0.1",
+		},
+	}
+
+	ca, err := genCA()
+	if err != nil {
+		t.Fatalf("cannot generate CA certificate: %s", err)
+	}
+
+	rootCAs := x509.NewCertPool()
+	rootCAs.AddCert(ca.Leaf)
+
+	for name, test := range testcases {
+		t.Run(name, func(t *testing.T) {
+			peerCerts, err := genSignedCert(
+				ca,
+				x509.KeyUsageCertSign,
+				false,
+				test.commonName,
+				test.dnsNames,
+				test.ips,
+				false)
+			if err != nil {
+				t.Fatalf("cannot generate peer certificate: %s", err)
+			}
+
+			cfg := &TLSConfig{
+				RootCAs:      rootCAs,
+				Verification: test.verificationMode,
+				ServerName:   test.serverName,
+			}
+			verifier := makeVerifyConnection(cfg)
+
+			err = verifier(tls.ConnectionState{
+				PeerCertificates: []*x509.Certificate{peerCerts.Leaf},
+				VerifiedChains:   [][]*x509.Certificate{test.peerCerts},
+			})
+
+			if test.expectingError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestVerificationMode(t *testing.T) {
+	testcases := map[string]struct {
+		verificationMode TLSVerificationMode
+		expectingError   bool
+
+		// hostname is used to make connection
+		hostname string
+
+		// ignoreCerts do not add the Root CA to the trust chain
+		ignoreCerts bool
+
+		// commonName used in the Certificate
+		commonName string
+
+		// dnsNames is used as the SNA DNSNames
+		dnsNames []string
+
+		// ips is used as the SNA IPAddresses
+		ips []net.IP
+	}{
+		"VerifyFull validates domain": {
+			verificationMode: VerifyFull,
+			hostname:         "localhost",
+			dnsNames:         []string{"localhost"},
+		},
+		"VerifyFull validates IPv4": {
+			verificationMode: VerifyFull,
+			hostname:         "127.0.0.1",
+			ips:              []net.IP{net.IPv4(127, 0, 0, 1)},
+		},
+		"VerifyFull validates IPv6": {
+			verificationMode: VerifyFull,
+			hostname:         "::1",
+			ips:              []net.IP{net.ParseIP("::1")},
+		},
+		"VerifyFull domain mismatch returns error": {
+			verificationMode: VerifyFull,
+			hostname:         "localhost",
+			dnsNames:         []string{"example.com"},
+			expectingError:   true,
+		},
+		"VerifyFull IPv4 mismatch returns error": {
+			verificationMode: VerifyFull,
+			hostname:         "127.0.0.1",
+			ips:              []net.IP{net.IPv4(10, 0, 0, 1)},
+			expectingError:   true,
+		},
+		"VerifyFull IPv6 mismatch returns error": {
+			verificationMode: VerifyFull,
+			hostname:         "::1",
+			ips:              []net.IP{net.ParseIP("faca:b0de:baba::ca")},
+			expectingError:   true,
+		},
+		"VerifyFull does not return error when SNA is empty and legacy Common Name is used": {
+			verificationMode: VerifyFull,
+			hostname:         "localhost",
+			commonName:       "localhost",
+			expectingError:   false,
+		},
+		"VerifyFull does not return error when SNA is empty and legacy Common Name is used with IP address": {
+			verificationMode: VerifyFull,
+			hostname:         "127.0.0.1",
+			commonName:       "127.0.0.1",
+			expectingError:   false,
+		},
+
+		"VerifyStrict validates domain": {
+			verificationMode: VerifyStrict,
+			hostname:         "localhost",
+			dnsNames:         []string{"localhost"},
+		},
+		"VerifyStrict validates IPv4": {
+			verificationMode: VerifyStrict,
+			hostname:         "127.0.0.1",
+			ips:              []net.IP{net.IPv4(127, 0, 0, 1)},
+		},
+		"VerifyStrict validates IPv6": {
+			verificationMode: VerifyStrict,
+			hostname:         "::1",
+			ips:              []net.IP{net.ParseIP("::1")},
+		},
+		"VerifyStrict domain mismatch returns error": {
+			verificationMode: VerifyStrict,
+			hostname:         "127.0.0.1",
+			dnsNames:         []string{"example.com"},
+			expectingError:   true,
+		},
+		"VerifyStrict IPv4 mismatch returns error": {
+			verificationMode: VerifyStrict,
+			hostname:         "127.0.0.1",
+			ips:              []net.IP{net.IPv4(10, 0, 0, 1)},
+			expectingError:   true,
+		},
+		"VerifyStrict IPv6 mismatch returns error": {
+			verificationMode: VerifyStrict,
+			hostname:         "::1",
+			ips:              []net.IP{net.ParseIP("faca:b0de:baba::ca")},
+			expectingError:   true,
+		},
+		"VerifyStrict returns error when SNA is empty and legacy Common Name is used": {
+			verificationMode: VerifyStrict,
+			hostname:         "localhost",
+			commonName:       "localhost",
+			expectingError:   true,
+		},
+		"VerifyStrict returns error when SNA is empty and legacy Common Name is used with IP address": {
+			verificationMode: VerifyStrict,
+			hostname:         "127.0.0.1",
+			commonName:       "127.0.0.1",
+			expectingError:   true,
+		},
+		"VerifyStrict returns error when SNA is empty": {
+			verificationMode: VerifyStrict,
+			hostname:         "localhost",
+			expectingError:   true,
+		},
+
+		"VerifyCertificate does not validate domain": {
+			verificationMode: VerifyCertificate,
+			hostname:         "localhost",
+			dnsNames:         []string{"example.com"},
+		},
+		"VerifyCertificate does not validate IPv4": {
+			verificationMode: VerifyCertificate,
+			hostname:         "127.0.0.1",
+			dnsNames:         []string{"example.com"}, // I believe it cannot be empty
+		},
+		"VerifyCertificate does not validate IPv6": {
+			verificationMode: VerifyCertificate,
+			hostname:         "127.0.0.1",
+			ips:              []net.IP{net.ParseIP("faca:b0de:baba::ca")},
+		},
+
+		"VerifyNone accepts untrusted certificates": {
+			verificationMode: VerifyNone,
+			hostname:         "127.0.0.1",
+			ignoreCerts:      true,
+		},
+	}
+	caCert, err := genCA()
+	if err != nil {
+		t.Fatalf("could not generate root CA certificate: %s", err)
+	}
+
+	certPool := x509.NewCertPool()
+	certPool.AddCert(caCert.Leaf)
+
+	for name, test := range testcases {
+		t.Run(name, func(t *testing.T) {
+			certs, err := genSignedCert(caCert, x509.KeyUsageCertSign, false, test.commonName, test.dnsNames, test.ips, false)
+			if err != nil {
+				t.Fatalf("could not generate certificates: %s", err)
+			}
+			serverURL := startTestServer(t, "localhost:0", []tls.Certificate{certs})
 
 			tlsC := TLSConfig{
 				Verification: test.verificationMode,
 				RootCAs:      certPool,
-				ServerName:   test.serverName,
+				ServerName:   test.hostname,
 			}
 
 			if test.ignoreCerts {
@@ -386,11 +609,15 @@ func TestVerificationMode(t *testing.T) {
 
 			client := http.Client{
 				Transport: &http.Transport{
-					TLSClientConfig: tlsC.BuildModuleClientConfig(test.serverName),
+					TLSClientConfig: tlsC.BuildModuleClientConfig(test.hostname),
 				},
 			}
 
-			resp, err := client.Get(serverURL.String())
+			resp, err := client.Get(serverURL.String()) //nolint:noctx // It is a test
+			if err == nil {
+				resp.Body.Close()
+			}
+
 			if test.expectingError {
 				if err != nil {
 					// We got the expected error, no need to check the status code
@@ -409,17 +636,22 @@ func TestVerificationMode(t *testing.T) {
 	}
 }
 
-// startTestServer starts a HTTP server for testing and returns it's certificates.
-// If `address` is a hostname it will be added to the leaf certificate CN.
-// Regardless of being a hostname or IP, `address` will be added to the correct
-// SNA.
+// startTestServer starts a HTTP server for testing using the provided
+// ceertificates and it binds to serverAddr.
 //
-// New certificates are generated for each HTTP server, they use RSA 1024 bits, it
-// is not the safest, but it's enough for tests.
+// serverAddr must contain the port, e.g: localhost:12345. To get a random
+// free port assigned, use port 0, e.g: "localhost:0".
+//
+// All requests are responded with an HTTP 200 OK and a plain
+// text string
+//
 // The HTTP server will shutdown at the end of the test.
-func startTestServer(t *testing.T, address string, emptySNA, legacyCN bool) (url.URL, *x509.Certificate) {
+func startTestServer(t *testing.T, serverAddr string, serverCerts []tls.Certificate) url.URL {
 	// Creates a listener on a random port selected by the OS
 	l, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatalf("could call net.Listen: %s", err)
+	}
 	t.Cleanup(func() { l.Close() })
 
 	// l.Addr().String() will return something like: 127.0.0.1:12345,
@@ -429,144 +661,143 @@ func startTestServer(t *testing.T, address string, emptySNA, legacyCN bool) (url
 		t.Fatal(err)
 	}
 
-	// Generate server ceritficates for the given address
-	// and start the server
-	caCert, serverCert := genVerifyCerts(t, address, emptySNA, legacyCN)
-	server := http.Server{
+	server := http.Server{ //nolint:gosec // This server is used only for tests.
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Write([]byte("SSL test server"))
+			if _, err := w.Write([]byte("SSL test server")); err != nil {
+				t.Errorf("coluld not write to client: %s", err)
+			}
 		}),
-		TLSConfig: &tls.Config{
-			Certificates: []tls.Certificate{serverCert},
+		TLSConfig: &tls.Config{ //nolint:gosec // This TLS config is used only for testing.
+			Certificates: serverCerts,
 		},
 	}
 	t.Cleanup(func() { server.Close() })
-	go server.ServeTLS(l, "", "")
+	go func() {
+		if err := server.ServeTLS(l, "", ""); err != nil {
+			if !errors.Is(err, http.ErrServerClosed) {
+				t.Errorf("HTTPS server exited unexpectedly: %s", err)
+			}
+		}
+	}()
 
-	return *serverURL, caCert
+	return *serverURL
 }
 
-func genVerifyCerts(t *testing.T, hostnameOrIP string, emptySNA, legacyCN bool) (*x509.Certificate, tls.Certificate) {
-	t.Helper()
+func getFingerprint(cert *x509.Certificate) string {
+	caSHA256 := sha256.Sum256(cert.Raw)
+	return hex.EncodeToString(caSHA256[:])
+}
 
-	hostname := ""
-	ipAddress := net.ParseIP(hostnameOrIP)
-	subjectCommonName := "You Know, for Search"
-
-	if legacyCN {
-		// Legacy behaviour of using the Common Name field to hold
-		// a hostname or IP address
-		subjectCommonName = hostnameOrIP
+func genTestCerts(t *testing.T) map[string]*x509.Certificate {
+	ca, err := genCA()
+	if err != nil {
+		t.Fatalf("cannot generate root CA: %s", err)
 	}
 
-	// We set either hostname or ipAddress
-	if ipAddress == nil {
-		hostname = hostnameOrIP
+	unknownCA, err := genCA()
+	if err != nil {
+		t.Fatalf("cannot generate second root CA: %s", err)
 	}
 
-	// ========================== Root CA Cert
-	ca := &x509.Certificate{
-		SerialNumber: big.NewInt(42),
-		Subject: pkix.Name{
-			Organization:  []string{"Root CA Corp"},
-			Country:       []string{"DE"},
-			Province:      []string{""},
-			Locality:      []string{"Berlin"},
-			StreetAddress: []string{"PostdamerPlatz"},
-			PostalCode:    []string{"42"},
+	certs := map[string]*x509.Certificate{
+		"ca": ca.Leaf,
+	}
+
+	certData := map[string]struct {
+		ca       tls.Certificate
+		keyUsage x509.KeyUsage
+		isCA     bool
+		dnsNames []string
+		ips      []net.IP
+		expired  bool
+	}{
+		"wildcard": {
+			ca:       ca,
+			keyUsage: x509.KeyUsageDigitalSignature,
+			isCA:     false,
+			dnsNames: []string{"*.example.com"},
 		},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().AddDate(100, 0, 0), // 100 years validity
-		IsCA:                  true,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
-		BasicConstraintsValid: true,
-	}
-
-	// ========================== Generate RootCA private Key
-	caPrivKey, err := rsa.GenerateKey(rand.Reader, 1024)
-	if err != nil {
-		log.Panicf("generating RSA key for CA cert: %v", err)
-	}
-
-	// ========================== Generate RootCA Cert
-	caBytes, err := x509.CreateCertificate(rand.Reader, ca, ca, &caPrivKey.PublicKey, caPrivKey)
-	if err != nil {
-		log.Panicf("generating CA certificate: %v", err)
-	}
-
-	caPEM := new(bytes.Buffer)
-	pem.Encode(caPEM, &pem.Block{
-		Type:  "CERTIFICATE",
-		Bytes: caBytes,
-	})
-
-	// ========================== Generate Server Certificate (leaf)
-	cert := &x509.Certificate{
-		SerialNumber: big.NewInt(100),
-		Subject: pkix.Name{
-			Organization:  []string{"My Server Application Corp"},
-			Country:       []string{"DE"},
-			Province:      []string{""},
-			Locality:      []string{"Berlin"},
-			StreetAddress: []string{"AlexanderPlatz"},
-			PostalCode:    []string{"100"},
-			CommonName:    subjectCommonName,
+		"correct": {
+			ca:       ca,
+			keyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+			isCA:     false,
+			dnsNames: []string{"localhost"},
+			// IPV4 and IPV6
+			ips: []net.IP{{127, 0, 0, 1}, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
 		},
-
-		// SNA - Subject Alternate Name we don't populate
-		EmailAddresses: nil,
-		URIs:           nil,
-
-		NotBefore:    time.Now(),
-		NotAfter:     time.Now().AddDate(10, 0, 0),
-		SubjectKeyId: []byte{1, 2, 3, 4, 6},
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
-		KeyUsage:     x509.KeyUsageDigitalSignature,
+		"unknown_authority": {
+			ca:       unknownCA,
+			keyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+			isCA:     false,
+			dnsNames: []string{"localhost"},
+			// IPV4 and IPV6
+			ips: []net.IP{{127, 0, 0, 1}, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+		},
+		"expired": {
+			ca:       ca,
+			keyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+			isCA:     false,
+			dnsNames: []string{"localhost"},
+			// IPV4 and IPV6
+			ips:     []net.IP{{127, 0, 0, 1}, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+			expired: true,
+		},
 	}
 
-	// Set SNA based on what we got
-	if !emptySNA {
-		if hostname != "" {
-			cert.DNSNames = []string{hostnameOrIP}
+	tmpDir := t.TempDir()
+	for certName, data := range certData {
+		cert, err := genSignedCert(
+			data.ca,
+			data.keyUsage,
+			data.isCA,
+			certName,
+			data.dnsNames,
+			data.ips,
+			data.expired,
+		)
+		if err != nil {
+			t.Fatalf("could not generate certificate '%s': %s", certName, err)
 		}
-		if ipAddress != nil {
-			cert.IPAddresses = []net.IP{ipAddress}
+		certs[certName] = cert.Leaf
+
+		// We write the certificate to disk, so if the test fails the certs can
+		// be inspected/reused
+		certPEM := new(bytes.Buffer)
+		pem.Encode(certPEM, &pem.Block{
+			Type:  "CERTIFICATE",
+			Bytes: cert.Leaf.Raw,
+		})
+
+		serverCertFile, err := os.Create(filepath.Join(tmpDir, certName+".crt"))
+		if err != nil {
+			t.Fatalf("creating file to write server certificate: %v", err)
+		}
+		if _, err := serverCertFile.Write(certPEM.Bytes()); err != nil {
+			t.Fatalf("writing server certificate: %v", err)
+		}
+
+		if err := serverCertFile.Close(); err != nil {
+			t.Fatalf("could not close certificate file: %s", err)
 		}
 	}
 
-	certPrivKey, err := rsa.GenerateKey(rand.Reader, 1024)
-	if err != nil {
-		log.Panicf("generating certificate private key: %v", err)
-	}
+	t.Cleanup(func() {
+		if t.Failed() {
+			finalDir := filepath.Join(os.TempDir(), cleanStr(t.Name())+strconv.Itoa(rand.Int()))
+			if err := os.Rename(tmpDir, finalDir); err != nil {
+				t.Fatalf("could not rename directory with certificates: %s", err)
+			}
 
-	// =========================== Use CA to sign/generate the server (leaf) certificate
-	certBytes, err := x509.CreateCertificate(rand.Reader, cert, ca, &certPrivKey.PublicKey, caPrivKey)
-	if err != nil {
-		log.Panicf("generating certificate: %v", err)
-	}
-
-	rootCACert, err := x509.ParseCertificate(caBytes)
-	if err != nil {
-		t.Fatalf("could not parse rootBytes into a certificate: %v", err)
-	}
-
-	certPEM := new(bytes.Buffer)
-	pem.Encode(certPEM, &pem.Block{
-		Type:  "CERTIFICATE",
-		Bytes: certBytes,
+			t.Logf("certificates persisted on: '%s'", finalDir)
+		}
 	})
 
-	certPrivKeyPEM := new(bytes.Buffer)
-	pem.Encode(certPrivKeyPEM, &pem.Block{
-		Type:  "RSA PRIVATE KEY",
-		Bytes: x509.MarshalPKCS1PrivateKey(certPrivKey),
-	})
+	return certs
+}
 
-	serverCert, err := tls.X509KeyPair(certPEM.Bytes(), certPrivKeyPEM.Bytes())
-	if err != nil {
-		t.Fatalf("could not convert server certificate to tls.Certificate: %v", err)
-	}
+var cleanRegExp = regexp.MustCompile(`[^a-zA-Z0-9]`)
 
-	return rootCACert, serverCert
+// cleanStr replaces all characters that do not match 'a-zA-Z0-9' by '_'
+func cleanStr(path string) string {
+	return cleanRegExp.ReplaceAllString(path, "_")
 }

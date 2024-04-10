@@ -72,8 +72,9 @@ var tlsCipherSuites = map[string]CipherSuite{
 }
 
 var tlsCipherSuitesInverse = make(map[CipherSuite]string, len(tlsCipherSuites))
-var tlsRenegotiationSupportTypesInverse = make(map[TlsRenegotiationSupport]string, len(tlsRenegotiationSupportTypes))
+var tlsRenegotiationSupportTypesInverse = make(map[TLSRenegotiationSupport]string, len(tlsRenegotiationSupportTypes))
 var tlsVerificationModesInverse = make(map[TLSVerificationMode]string, len(tlsVerificationModes))
+var tlsClientAuthTypesInverse = make(map[TLSClientAuth]string, len(tlsClientAuthTypes))
 
 // Init creates a inverse representation of the values mapping.
 func init() {
@@ -88,6 +89,10 @@ func init() {
 	for name, t := range tlsVerificationModes {
 		tlsVerificationModesInverse[t] = name
 	}
+
+	for name, t := range tlsClientAuthTypes {
+		tlsClientAuthTypesInverse[t] = name
+	}
 }
 
 var tlsCurveTypes = map[string]tlsCurveType{
@@ -97,24 +102,26 @@ var tlsCurveTypes = map[string]tlsCurveType{
 	"X25519": tlsCurveType(tls.X25519),
 }
 
-var tlsRenegotiationSupportTypes = map[string]TlsRenegotiationSupport{
-	"never":  TlsRenegotiationSupport(tls.RenegotiateNever),
-	"once":   TlsRenegotiationSupport(tls.RenegotiateOnceAsClient),
-	"freely": TlsRenegotiationSupport(tls.RenegotiateFreelyAsClient),
+var tlsRenegotiationSupportTypes = map[string]TLSRenegotiationSupport{
+	"never":  TLSRenegotiationSupport(tls.RenegotiateNever),
+	"once":   TLSRenegotiationSupport(tls.RenegotiateOnceAsClient),
+	"freely": TLSRenegotiationSupport(tls.RenegotiateFreelyAsClient),
 }
 
-type tlsClientAuth int
+type TLSClientAuth int
 
 const (
-	tlsClientAuthNone     tlsClientAuth = tlsClientAuth(tls.NoClientCert)
-	tlsClientAuthOptional               = tlsClientAuth(tls.VerifyClientCertIfGiven)
-	tlsClientAuthRequired               = tlsClientAuth(tls.RequireAndVerifyClientCert)
+	TLSClientAuthNone     TLSClientAuth = TLSClientAuth(tls.NoClientCert)
+	TLSClientAuthOptional               = TLSClientAuth(tls.VerifyClientCertIfGiven)
+	TLSClientAuthRequired               = TLSClientAuth(tls.RequireAndVerifyClientCert)
+
+	unknownType = "unknown"
 )
 
-var tlsClientAuthTypes = map[string]tlsClientAuth{
-	"none":     tlsClientAuthNone,
-	"optional": tlsClientAuthOptional,
-	"required": tlsClientAuthRequired,
+var tlsClientAuthTypes = map[string]TLSClientAuth{
+	"none":     TLSClientAuthNone,
+	"optional": TLSClientAuthOptional,
+	"required": TLSClientAuthRequired,
 }
 
 // TLSVerificationMode represents the type of verification to do on the remote host:
@@ -131,7 +138,6 @@ const (
 )
 
 var tlsVerificationModes = map[string]TLSVerificationMode{
-	"":            VerifyFull,
 	"full":        VerifyFull,
 	"strict":      VerifyStrict,
 	"none":        VerifyNone,
@@ -142,7 +148,7 @@ func (m TLSVerificationMode) String() string {
 	if s, ok := tlsVerificationModesInverse[m]; ok {
 		return s
 	}
-	return "unknown"
+	return unknownType
 }
 
 // MarshalText marshal the verification mode into a human readable value.
@@ -164,6 +170,10 @@ func (m *TLSVerificationMode) Unpack(in interface{}) error {
 	if !ok {
 		return fmt.Errorf("verification mode must be an identifier")
 	}
+	if s == "" {
+		*m = VerifyFull
+		return nil
+	}
 
 	mode, found := tlsVerificationModes[s]
 	if !found {
@@ -174,20 +184,28 @@ func (m *TLSVerificationMode) Unpack(in interface{}) error {
 	return nil
 }
 
-func (m *tlsClientAuth) Unpack(in interface{}) error {
-	if in == nil {
-		*m = tlsClientAuthRequired
+func (m TLSClientAuth) String() string {
+	if s, ok := tlsClientAuthTypesInverse[m]; ok {
+		return s
+	}
+	return unknownType
+}
+
+func (m TLSClientAuth) MarshalText() ([]byte, error) {
+	if s, ok := tlsClientAuthTypesInverse[m]; ok {
+		return []byte(s), nil
+	}
+	return nil, fmt.Errorf("could not marshal '%+v' to text", m)
+}
+
+func (m *TLSClientAuth) Unpack(s string) error {
+	if s == "" {
+		*m = TLSClientAuthNone
 		return nil
 	}
-
-	s, ok := in.(string)
-	if !ok {
-		return fmt.Errorf("client authentication must be an identifier")
-	}
-
 	mode, found := tlsClientAuthTypes[s]
 	if !found {
-		return fmt.Errorf("unknown client authentication mode'%v'", s)
+		return fmt.Errorf("unknown client authentication mode '%v'", s)
 	}
 
 	*m = mode
@@ -210,7 +228,7 @@ func (cs CipherSuite) String() string {
 	if s, found := tlsCipherSuitesInverse[cs]; found {
 		return s
 	}
-	return "unknown"
+	return unknownType
 }
 
 type tlsCurveType tls.CurveID
@@ -225,16 +243,16 @@ func (ct *tlsCurveType) Unpack(s string) error {
 	return nil
 }
 
-type TlsRenegotiationSupport tls.RenegotiationSupport
+type TLSRenegotiationSupport tls.RenegotiationSupport
 
-func (r TlsRenegotiationSupport) String() string {
+func (r TLSRenegotiationSupport) String() string {
 	if t, found := tlsRenegotiationSupportTypesInverse[r]; found {
 		return t
 	}
-	return "<unknown>"
+	return "<" + unknownType + ">"
 }
 
-func (r *TlsRenegotiationSupport) Unpack(s string) error {
+func (r *TLSRenegotiationSupport) Unpack(s string) error {
 	t, found := tlsRenegotiationSupportTypes[s]
 	if !found {
 		return fmt.Errorf("invalid tls renegotiation type '%v'", s)
@@ -244,7 +262,7 @@ func (r *TlsRenegotiationSupport) Unpack(s string) error {
 	return nil
 }
 
-func (r TlsRenegotiationSupport) MarshalText() ([]byte, error) {
+func (r TLSRenegotiationSupport) MarshalText() ([]byte, error) {
 	if t, found := tlsRenegotiationSupportTypesInverse[r]; found {
 		return []byte(t), nil
 	}
@@ -252,7 +270,7 @@ func (r TlsRenegotiationSupport) MarshalText() ([]byte, error) {
 	return nil, fmt.Errorf("could not marshal '%+v' to text", r)
 }
 
-func (r TlsRenegotiationSupport) MarshalYAML() (interface{}, error) {
+func (r TLSRenegotiationSupport) MarshalYAML() (interface{}, error) {
 	if t, found := tlsRenegotiationSupportTypesInverse[r]; found {
 		return t, nil
 	}
@@ -262,9 +280,10 @@ func (r TlsRenegotiationSupport) MarshalYAML() (interface{}, error) {
 
 // CertificateConfig define a common set of fields for a certificate.
 type CertificateConfig struct {
-	Certificate string `config:"certificate" yaml:"certificate,omitempty"`
-	Key         string `config:"key" yaml:"key,omitempty"`
-	Passphrase  string `config:"key_passphrase" yaml:"key_passphrase,omitempty"`
+	Certificate    string `config:"certificate" yaml:"certificate,omitempty"`
+	Key            string `config:"key" yaml:"key,omitempty"`
+	Passphrase     string `config:"key_passphrase" yaml:"key_passphrase,omitempty"`
+	PassphrasePath string `config:"key_passphrase_path" yaml:"key_passphrase_path,omitempty"`
 }
 
 // Validate validates the CertificateConfig

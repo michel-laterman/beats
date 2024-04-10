@@ -7,6 +7,8 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"math/rand"
@@ -480,6 +482,42 @@ func (c *enrollCmd) enrollWithBackoff(ctx context.Context, persistentConfig map[
 	return err
 }
 
+func (c *enrollCmd) tlsDiag(host string) {
+	c.log.Infow("Attempting to diagnose tls issues", "host", host)
+	conf := &tls.Config{
+		InsecureSkipVerify: true,
+	}
+
+	conn, err := tls.Dial("tcp", host, conf)
+	if err != nil {
+		c.log.Errorf("tls diag dial error: %w", err)
+		return
+	}
+	defer conn.Close()
+	certs := conn.ConnectionState().PeerCertificates
+	for _, cert := range certs {
+		c.log.Infow("Remote cert found", "issuer_name", cert.Issuer, "expiry", cert.NotAfter.Format("2006-January-02"), "common_name", cert.Issuer.CommonName, "dns_names", cert.DNSNames, "ips", cert.IPAddresses)
+	}
+	if c.remoteConfig.Transport.TLS == nil {
+		c.log.Info("remote config does not have tls information")
+		return
+	}
+	c.log.Infow("CA info", "cas", c.remoteConfig.Transport.TLS.CAs)
+	pool, errs := tlscommon.LoadCertificateAuthorities(c.remoteConfig.Transport.TLS.CAs)
+	if len(errs) != 0 {
+		c.log.Errorf("Unable to load remote config cas: %v", errs)
+		return
+	}
+	for _, sub := range pool.Subjects() {
+		crt, err := x509.ParseCertificate(sub)
+		if err != nil {
+			c.log.Errorf("Unable to parse ca cert: %v", err)
+			continue
+		}
+		c.log.Infow("CA cert", "issuer_name", crt.Issuer, "common_name", crt.Issuer.CommonName)
+	}
+}
+
 func (c *enrollCmd) enroll(ctx context.Context, persistentConfig map[string]interface{}) error {
 	cmd := fleetapi.NewEnrollCmd(c.client)
 
@@ -499,6 +537,7 @@ func (c *enrollCmd) enroll(ctx context.Context, persistentConfig map[string]inte
 
 	resp, err := cmd.Execute(ctx, r)
 	if err != nil {
+		c.tlsDiag(c.remoteConfig.Host)
 		return errors.New(err,
 			"fail to execute request to fleet-server",
 			errors.TypeNetwork)
