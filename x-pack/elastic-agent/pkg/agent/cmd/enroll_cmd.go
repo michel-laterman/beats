@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"fmt"
 	"io"
 	"math/rand"
@@ -496,26 +495,13 @@ func (c *enrollCmd) tlsDiag(host string) {
 	defer conn.Close()
 	certs := conn.ConnectionState().PeerCertificates
 	for _, cert := range certs {
-		c.log.Infow("Remote cert found", "issuer_name", cert.Issuer, "expiry", cert.NotAfter.Format("2006-January-02"), "common_name", cert.Issuer.CommonName, "dns_names", cert.DNSNames, "ips", cert.IPAddresses)
+		c.log.Infow("Remote cert found", "issuer_name", cert.Issuer, "expiry", cert.NotAfter.Format("2006-January-02"), "common_name", cert.Issuer.CommonName, "dns_names", cert.DNSNames, "ips", cert.IPAddresses, "issuer", cert.RawIssuer, "sig", cert.Signature)
 	}
 	if c.remoteConfig.Transport.TLS == nil {
 		c.log.Info("remote config does not have tls information")
 		return
 	}
 	c.log.Infow("CA info", "cas", c.remoteConfig.Transport.TLS.CAs)
-	pool, errs := tlscommon.LoadCertificateAuthorities(c.remoteConfig.Transport.TLS.CAs)
-	if len(errs) != 0 {
-		c.log.Errorf("Unable to load remote config cas: %v", errs)
-		return
-	}
-	for _, sub := range pool.Subjects() {
-		crt, err := x509.ParseCertificate(sub)
-		if err != nil {
-			c.log.Errorf("Unable to parse ca cert: %v", err)
-			continue
-		}
-		c.log.Infow("CA cert", "issuer_name", crt.Issuer, "common_name", crt.Issuer.CommonName)
-	}
 }
 
 func (c *enrollCmd) enroll(ctx context.Context, persistentConfig map[string]interface{}) error {
